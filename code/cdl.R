@@ -1,6 +1,11 @@
 library(tidyverse)
 library(sf)
 library(rgdal)
+library(furrr)
+
+plan(multisession, workers = 8)
+
+
 
 # load Earth Engine dataset generated at 
 # https://code.earthengine.google.com/824794f20ce4320ac8625b49c9a49fec
@@ -25,7 +30,7 @@ unpack_dict <- function(x){
       setNames(c("id", "freq"))
 }
 
-# convert dataset to tidy table, add crop names
+# convert dataset to tidy table
 f <- 1:nrow(d) %>%
    map_df(function(i){
       if(d$counts[i] == "{}") return(NULL)
@@ -34,9 +39,81 @@ f <- 1:nrow(d) %>%
                 year = d$year[i])}) %>%
    as_tibble() %>%
    mutate(id = as.integer(id),
-          freq = as.numeric(freq)) %>%
+          freq = as.numeric(freq))
+
+
+## rebalance frequencies using confusion matrices #####
+
+states <- tigris::fips_codes %>%
+   select(state, state_code) %>%
+   distinct() %>%
+   filter(! state %in% c("AK", "HI")) %>%
+   slice(1:49)
+
+years <- 2008:2021
+
+# load confusion matrices
+matrices <- years %>%
+   map(function(year){
+      dirs <- list.dirs("big_data")
+      dir <- dirs[str_detect(dirs, as.character(year))]
+      
+      states$state %>%
+         future_map(function(state){
+            if(state == "DC") state <- "MD"
+            file <- list.files(dir, full.names = T,
+                               pattern = paste0("_", state))
+            cm <- readxl::read_xlsx(file[1], "All - Matrix") %>% 
+               select("1":"256") %>% 
+               slice(1:256) %>%
+               as.matrix() %>%
+               apply(1, function(x) x/sum(x)) %>% 
+               t()
+            cm[!is.finite(cm)] <- 0
+            return(cm)
+         }) %>%
+         setNames(states$state)
+   }) %>%
+   setNames(years)
+
+# adjust frequencies using confusion matrices
+f <- f %>%
+   full_join(expand_grid(fips = unique(.$fips), 
+                         year = unique(.$year),
+                         id = 1:256)) %>%
+   arrange(fips, year, id) %>%
+   mutate(freq = ifelse(is.na(freq), 0, freq)) %>%
+   split(paste(.$fips, .$year)) %>%
+   future_map(function(x){
+      year <- x$year[1]
+      fips <- x$fips[1]
+      state <- states$state[states$state_code == str_sub(fips, 1, 2)]
+      cm <- matrices[[as.character(year)]][[state]]
+      x %>% mutate(cfreq = as.vector(matrix(x$freq, 1) %*% cm))
+   }) %>%
+   bind_rows()
+
+f %>%
+   sample_n(100000) %>%
+   ggplot(aes(freq, cfreq)) +
+   geom_abline(color = "gray") +
+   geom_point(size = .25) +
+   scale_x_log10() +
+   scale_y_log10()
+
+
+# add crop names
+f <- f %>%
    left_join(id) %>%
    mutate(crop = tolower(crop))
+
+
+
+
+
+
+
+
 
 nonag <- c(0, 63:65, 81:195)
 
@@ -85,7 +162,7 @@ centroids <- bind_cols(fips = centroids$fips,
    rename(lon = X, lat = Y) %>%
    as_tibble()
 
-climate <- read_csv("e:/ca2cc/ca2cc-county/data/ignore/climate.csv") %>%
+climate <- read_csv("big_data/climate.csv") %>%
    filter(season != "growing_season",
           start == 1950) %>%
    select(fips, 
